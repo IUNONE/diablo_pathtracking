@@ -49,30 +49,30 @@ Control instructions 控制指令
 ### 2.1 运行 `diablo_ctrl_node` 获取控制权限
 
 您可以将您的控制指令以自定义msg : `MotionCtrl` 的格式发送到 `/diablo/MotionCmd` 实现控制效果。
+同时请先关闭遥控器
 
 ```bash
-cd zsh_ws/src
+cd zsh_ws
 source install/setup.bash
 ros2 run diablo_ctrl diablo_ctrl_node
 
-ros2 topic hz /diablo/sensor/Motors #check
+ros2 topic hz /diablo/sensor/Imu # check
 ```
 
-### 2.2 运行 location 获取里程计
-```bash
-sudo apt install ros-foxy-robot-localization
-install/pathtracking/bin/wheelodom
-
-ros2 run robot_localization ekf_node --ros-args --params-file
-ros2 run tf2_ros tf2_echo odom base_link
-```
-
-### 2.3 运行 tracker 节点追踪轨迹
+### 2.2 运行 tracker 节点追踪轨迹
 ```bash
 cd zsh_ws/src
 source install/setup.bash
 colcon build --packages-select pathtracking
 
-install/pathtracking/bin/diablotrack
-install/pathtracking/bin/testtrack
+install/pathtracking/bin/wheelodom
+
+# publich odom tf
+install/pathtracking/bin/ekfodom # or run in another pc: python -B ekf_odom.py
+
+# start track node
+install/pathtracking/bin/diablotrack --ros-args -p control_hz:=100 -p path_dt:=0.1
+
+# publish path to test
+install/pathtracking/bin/testtrack --ros-args -p path_length:=0.32 -p point_spacing:=0.02
 ```

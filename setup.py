@@ -23,6 +23,7 @@ setup(
             'diablotrack = scripts.diablo_track:main',
             'testtrack = scripts.test_track:main',
             'wheelodom = scripts.wheel_odom:main',
+            'ekfodom = scripts.ekf_odom:main',
         ],
     },
 )

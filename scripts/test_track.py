@@ -37,7 +37,7 @@ class TestTrackNode(Node):
             self.create_timer(1.0 / self.publish_rate_, self._publish_path)
         else:
             # Publish once after a short delay
-            self.create_timer(1.0, self._publish_once)
+            self.create_timer(10.0, self._publish_once)
         
         self.get_logger().info(f'Test Track Node initialized with path type: {self.path_type_}')
         self.get_logger().info(f'Generated path with {len(self.test_path_.poses)} points')

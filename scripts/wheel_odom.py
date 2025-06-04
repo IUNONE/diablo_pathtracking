@@ -4,8 +4,9 @@ import math
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Quaternion, Twist, Vector3
+from geometry_msgs.msg import Quaternion, Twist, Vector3, TransformStamped
 from motion_msgs.msg import LegMotors
+import tf2_ros
 
 class WheelOdometryNode(Node):
     
@@ -19,10 +20,13 @@ class WheelOdometryNode(Node):
         self.declare_parameter('robot_odom_frame', 'odom')
         self.declare_parameter('robot_base_frame', 'base_link')
 
+        self.declare_parameter('is_pub_tf', True)
+
         self.wheel_radius_ = self.get_parameter('wheel_radius').get_parameter_value().double_value
         self.wheel_base_ = self.get_parameter('wheel_base').get_parameter_value().double_value
         self.robot_odom_frame_ = self.get_parameter('robot_odom_frame').get_parameter_value().string_value
         self.robot_base_frame_ = self.get_parameter('robot_base_frame').get_parameter_value().string_value
+        self.is_pub_tf_ = self.get_parameter('is_pub_tf').get_parameter_value().bool_value
 
         # State variables
         self.x = 0.0
@@ -38,6 +42,9 @@ class WheelOdometryNode(Node):
             self.motors_callback,
             10
         )
+        
+        # TF broadcaster
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         
         self.get_logger().info(f'Wheel odometry node started with radius={self.wheel_radius_}, wheelbase={self.wheel_base_}')
     
@@ -103,6 +110,21 @@ class WheelOdometryNode(Node):
         odom.twist.covariance[35] = 0.05  # vyaw
         
         self.odom_pub.publish(odom)
+        
+        # Publish TF transform if enabled
+        if self.is_pub_tf_:
+            transform = TransformStamped()
+            transform.header.stamp = current_time
+            transform.header.frame_id = self.robot_odom_frame_
+            transform.child_frame_id = self.robot_base_frame_
+            
+            transform.transform.translation.x = self.x
+            transform.transform.translation.y = self.y
+            transform.transform.translation.z = 0.0
+            transform.transform.rotation = self.yaw_to_quaternion(self.yaw)
+            
+            self.tf_broadcaster.sendTransform(transform)
+        
         self.last_time = current_time
         self.get_logger().info(
             f"Published odometry: x={self.x:.2f}, y={self.y:.2f}, yaw={self.yaw:.2f}, "
