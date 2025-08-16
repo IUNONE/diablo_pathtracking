@@ -5,7 +5,7 @@
 #include "diablo_pathtracking/msg/motion_ctrl.hpp"  // generated from MotionCtrl.msg
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
-#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.h"
 #include <cmath>
 #include <vector>
 #include <array>
@@ -48,9 +48,28 @@ public:
         decel_distance_ = declare_parameter("decel_distance", 0.2);
         min_decel_factor_ = declare_parameter("min_decel_factor", 0.1);
         ki_linear_ = declare_parameter("ki_linear", 0.05);
+        enable_curveadapt_ = declare_parameter("enable_curveadapt", true);
 
-        if (strategy_ != "pd" && strategy_ != "open_loop") {
+        if (strategy_ != "pd" && strategy_ != "pid" && strategy_ != "open_loop") {
             RCLCPP_FATAL(get_logger(), "Invalid strategy: %s", strategy_.c_str());
+            rclcpp::shutdown();
+        }
+
+        // Parameter validation
+        if (control_hz_ <= 0 || control_hz_ > 1000) {
+            RCLCPP_FATAL(get_logger(), "Invalid control_hz: %d (must be 1-1000)", control_hz_);
+            rclcpp::shutdown();
+        }
+        if (path_dt_ <= 0.0 || path_dt_ > 1.0) {
+            RCLCPP_FATAL(get_logger(), "Invalid path_dt: %.3f (must be 0-1.0)", path_dt_);
+            rclcpp::shutdown();
+        }
+        if (max_linear_vel_ <= 0.0) {
+            RCLCPP_FATAL(get_logger(), "Invalid max_linear_vel: %.3f (must be > 0)", max_linear_vel_);
+            rclcpp::shutdown();
+        }
+        if (max_angular_vel_ <= 0.0) {
+            RCLCPP_FATAL(get_logger(), "Invalid max_angular_vel: %.3f (must be > 0)", max_angular_vel_);
             rclcpp::shutdown();
         }
 
@@ -77,20 +96,33 @@ private:
             RCLCPP_WARN(get_logger(), "Received path with less than 2 points, ignoring");
             return;
         }
+        
+        // Atomic path update and state reset
         path_points_.clear();
         path_points_.reserve(msg->poses.size());
         for (auto &pose : msg->poses) {
             double yaw = get_yaw_from_quaternion(pose.pose.orientation);
             path_points_.push_back({pose.pose.position.x, pose.pose.position.y, yaw});
         }
+        
+        // Reset all control states
         path_start_time_ = now();
         current_time_index_ = 0.0;
         prev_pos_error_ = {0.0, 0.0};
         integral_error_ = {0.0, 0.0};
         prev_time_valid_ = false;
+        prev_angle_error_ = 0.0;
+        prev_angle_time_valid_ = false;
         current_linear_vel_ = 0.0;
+        tf_failure_count_ = 0;
+        fallback_to_openloop_ = false;
+        
+        // Update path version to ensure control loop uses latest path
+        path_version_.fetch_add(1);
         path_updated_ = true;
-        RCLCPP_INFO(get_logger(), "New path received with %zu points", msg->poses.size());
+        
+        RCLCPP_INFO(get_logger(), "New path received with %zu points, version: %lu, strategy: %s", 
+                   msg->poses.size(), path_version_.load(), strategy_.c_str());
     }
 
     double get_yaw_from_quaternion(const geometry_msgs::msg::Quaternion &q)
@@ -103,14 +135,40 @@ private:
     bool get_robot_pose()
     {
         try {
-            geometry_msgs::msg::TransformStamped transform =
-                tf_buffer_.lookupTransform(robot_odom_frame_, robot_base_frame_, tf2::TimePointZero, tf2::durationFromSec(0.1));
+        geometry_msgs::msg::TransformStamped transform =
+            tf_buffer_.lookupTransform(robot_odom_frame_, robot_base_frame_, 
+                                     tf2::TimePointZero, tf2::durationFromSec(0.15));
             current_x_ = transform.transform.translation.x;
             current_y_ = transform.transform.translation.y;
             current_yaw_ = get_yaw_from_quaternion(transform.transform.rotation);
+            
+            // Reset TF failure count on successful lookup
+            if (tf_failure_count_ > 0) {
+                tf_failure_count_ = 0;
+                if (fallback_to_openloop_) {
+                    RCLCPP_INFO(get_logger(), "TF recovered, resuming normal operation");
+                    fallback_to_openloop_ = false;
+                }
+            }
             return true;
         } catch (tf2::TransformException &ex) {
-            RCLCPP_DEBUG(get_logger(), "TF lookup failed: %s", ex.what());
+            tf_failure_count_++;
+            
+            static rclcpp::Time last_warn_time = this->now();
+            auto current_time = this->now();
+            if ((current_time - last_warn_time).seconds() > 1.0) {
+                RCLCPP_WARN(get_logger(), "TF lookup failed (%d/%d): %s", 
+                           tf_failure_count_, MAX_TF_FAILURES, ex.what());
+                last_warn_time = current_time;
+            }
+            
+            // Switch to open-loop mode after consecutive failures
+            if (tf_failure_count_ >= MAX_TF_FAILURES && !fallback_to_openloop_) {
+                fallback_to_openloop_ = true;
+                RCLCPP_WARN(get_logger(), "TF lookup failed %d times, switching to open-loop mode", 
+                           MAX_TF_FAILURES);
+            }
+            
             return false;
         }
     }
@@ -170,19 +228,37 @@ private:
         if (prev_time_valid_) {
             double dt = (now_time - prev_time_).seconds();
             if (dt > 0) {
-                integral_error_[0] += pos_error[0] * dt;
-                integral_error_[1] += pos_error[1] * dt;
-                double max_integral = ki_linear_ > 0 ? (1.0 / ki_linear_) : 1.0;
-                integral_error_[0] = std::clamp(integral_error_[0], -max_integral, max_integral);
-                integral_error_[1] = std::clamp(integral_error_[1], -max_integral, max_integral);
                 std::array<double, 2> error_rate = {
                     (pos_error[0] - prev_pos_error_[0]) / dt,
                     (pos_error[1] - prev_pos_error_[1]) / dt
                 };
-                desired_vel_pid = {
-                    kp_linear_ * pos_error[0] + ki_linear_ * integral_error_[0] + kd_linear_ * error_rate[0],
-                    kp_linear_ * pos_error[1] + ki_linear_ * integral_error_[1] + kd_linear_ * error_rate[1]
-                };
+                
+                // PID control with conditional integration
+                if (strategy_ == "pid") {
+                    double temp_vel_x = kp_linear_ * pos_error[0] + ki_linear_ * integral_error_[0];
+                    double temp_vel_y = kp_linear_ * pos_error[1] + ki_linear_ * integral_error_[1];
+                    double temp_vel_mag = std::hypot(temp_vel_x, temp_vel_y);
+                    
+                    if (temp_vel_mag < current_max_linear * 0.95) {
+                        integral_error_[0] += pos_error[0] * dt;
+                        integral_error_[1] += pos_error[1] * dt;
+                    }
+                    
+                    double max_integral = ki_linear_ > 0 ? (1.0 / ki_linear_) : 1.0;
+                    integral_error_[0] = std::clamp(integral_error_[0], -max_integral, max_integral);
+                    integral_error_[1] = std::clamp(integral_error_[1], -max_integral, max_integral);
+                    
+                    desired_vel_pid = {
+                        kp_linear_ * pos_error[0] + ki_linear_ * integral_error_[0] + kd_linear_ * error_rate[0],
+                        kp_linear_ * pos_error[1] + ki_linear_ * integral_error_[1] + kd_linear_ * error_rate[1]
+                    };
+                } else {
+                    // PD control only
+                    desired_vel_pid = {
+                        kp_linear_ * pos_error[0] + kd_linear_ * error_rate[0],
+                        kp_linear_ * pos_error[1] + kd_linear_ * error_rate[1]
+                    };
+                }
                 prev_pos_error_ = pos_error;
             }
         } else {
@@ -193,13 +269,22 @@ private:
         prev_time_ = now_time;
         double feedforward_weight = std::min(1.0, elapsed_time / feedforward_ramp_time_);
         if (at_path_end) feedforward_weight *= 0.5;
-        // curvature-based weighting
-        size_t idx = static_cast<size_t>(std::min(current_time_index_, (double)path_points_.size() - 2));
-        double dyaw = path_points_[idx+1][2] - path_points_[idx][2];
-        double ds = std::hypot(path_points_[idx+1][0] - path_points_[idx][0],
-                              path_points_[idx+1][1] - path_points_[idx][1]);
-        double curvature = ds > 1e-6 ? std::abs(dyaw / ds) : 0.0;
-        feedforward_weight *= (1.0 + curvature);
+        // Curvature adaptive feedforward control
+        double curvature_factor = 1.0;
+        if (enable_curveadapt_) {
+            if (path_points_.size() < 2) {
+                RCLCPP_ERROR(get_logger(), "Path too short for curvature calculation");
+                return {0.0, 0.0};
+            }
+            size_t max_idx = path_points_.size() - 2;
+            size_t idx = static_cast<size_t>(std::min(current_time_index_, (double)max_idx));
+            double dyaw = path_points_[idx+1][2] - path_points_[idx][2];
+            double ds = std::hypot(path_points_[idx+1][0] - path_points_[idx][0],
+                                  path_points_[idx+1][1] - path_points_[idx][1]);
+            double curvature = ds > 1e-6 ? std::abs(dyaw / ds) : 0.0;
+            curvature_factor = 1.0 / (1.0 + 2.0 * curvature);
+        }
+        feedforward_weight *= curvature_factor;
         std::array<double, 2> total_desired_vel = {
             feedforward_weight * desired_vel[0] + desired_vel_pid[0],
             feedforward_weight * desired_vel[1] + desired_vel_pid[1]
@@ -209,10 +294,23 @@ private:
         if (linear_vel > 1e-6) {
             double target_angle = std::atan2(total_desired_vel[1], total_desired_vel[0]);
             double angle_error = normalize_angle(target_angle - current_yaw_);
-            double dt_ang = (now_time - prev_time_).seconds();
-            double angle_error_rate = (angle_error - prev_angle_error_) / std::max(dt_ang, 1e-6);
-            angular_vel = kp_angular_ * angle_error + kd_angular_ * angle_error_rate;
+            
+            // Maintain separate time history for angular control
+            if (prev_angle_time_valid_) {
+                double dt_ang = (now_time - prev_angle_time_).seconds();
+                if (dt_ang > 0) {
+                    double angle_error_rate = (angle_error - prev_angle_error_) / dt_ang;
+                    angular_vel = kp_angular_ * angle_error + kd_angular_ * angle_error_rate;
+                } else {
+                    angular_vel = kp_angular_ * angle_error;
+                }
+            } else {
+                angular_vel = kp_angular_ * angle_error;
+                prev_angle_time_valid_ = true;
+            }
+            
             prev_angle_error_ = angle_error;
+            prev_angle_time_ = now_time;
         }
         linear_vel = std::clamp(linear_vel, -current_max_linear, current_max_linear);
         angular_vel = std::clamp(angular_vel, -current_max_angular, current_max_angular);
@@ -235,39 +333,82 @@ private:
     void control_loop()
     {
         std::lock_guard<std::mutex> lock(path_mutex_);
+        
+        // Check path version to ensure using latest path
+        uint64_t latest_version = path_version_.load();
+        if (current_path_version_ != latest_version) {
+            current_path_version_ = latest_version;
+            RCLCPP_DEBUG(get_logger(), "Switched to path version: %lu", current_path_version_);
+        }
+        
         if (!path_updated_ || path_points_.empty()) {
             publish_cmd(0.0, 0.0);
             return;
         }
-        if (!get_robot_pose()) {
-            RCLCPP_WARN(get_logger(), "Failed to get robot pose, stopping");
+        
+        // Try to get robot pose, fallback to open-loop if TF fails
+        bool tf_available = get_robot_pose();
+        if (!tf_available && !fallback_to_openloop_) {
             publish_cmd(0.0, 0.0);
             return;
         }
+        
         auto current_time = now();
         double elapsed_time = (current_time - path_start_time_).seconds();
-        current_time_index_ = elapsed_time / path_dt_;
+        current_time_index_ = std::min(elapsed_time / path_dt_, (double)(path_points_.size() - 1));
         auto [desired_pos, desired_vel] = get_desired_state(current_time_index_);
-        double goal_distance = std::hypot(path_points_.back()[0] - current_x_, path_points_.back()[1] - current_y_);
+        
         double linear_vel = 0.0;
         double angular_vel = 0.0;
         bool at_path_end = current_time_index_ >= path_points_.size() - 1;
-        if (strategy_ == "pd") {
+        
+        // Determine control strategy: use fallback mode if TF unavailable
+        std::string effective_strategy = (fallback_to_openloop_ || strategy_ == "open_loop") ? "open_loop" : strategy_;
+        
+        if ((effective_strategy == "pd" || effective_strategy == "pid") && tf_available) {
+            double goal_distance = std::hypot(path_points_.back()[0] - current_x_, path_points_.back()[1] - current_y_);
             std::tie(linear_vel, angular_vel) = calculate_pd_control(desired_pos, desired_vel, at_path_end, elapsed_time, goal_distance);
-        } else if (strategy_ == "open_loop") {
+            
+            // Check goal reached for PD control
+            if (at_path_end && goal_distance < precise_goal_tolerance_ && std::abs(current_linear_vel_) < velocity_tolerance_) {
+                RCLCPP_INFO(get_logger(), "Precise goal reached! Final distance: %.3f", goal_distance);
+                path_updated_ = false;
+            }
+        } else {
+            // Open-loop control (either by design or fallback)
             linear_vel = std::hypot(desired_vel[0], desired_vel[1]);
             if (linear_vel > 1e-6) {
                 double target_angle = std::atan2(desired_vel[1], desired_vel[0]);
-                double angle_error = normalize_angle(target_angle - current_yaw_);
-                angular_vel = kp_angular_ * angle_error;
+                if (tf_available) {
+                    double angle_error = normalize_angle(target_angle - current_yaw_);
+                    angular_vel = kp_angular_ * angle_error;
+                } else {
+                    // Use path orientation when TF unavailable
+                    size_t idx = static_cast<size_t>(std::min(current_time_index_, (double)path_points_.size() - 1));
+                    double path_yaw = path_points_[idx][2];
+                    double angle_error = normalize_angle(target_angle - path_yaw);
+                    angular_vel = kp_angular_ * angle_error * 0.5; // Reduced gain for safety
+                }
             }
             linear_vel = std::clamp(linear_vel, -max_linear_vel_, max_linear_vel_);
             angular_vel = std::clamp(angular_vel, -max_angular_vel_, max_angular_vel_);
+            
+            // Check path completion for open-loop control
+            if (at_path_end) {
+                RCLCPP_INFO(get_logger(), "Path execution completed (open-loop mode)");
+                path_updated_ = false;
+            }
         }
+        
         publish_cmd(linear_vel, angular_vel);
-        if (at_path_end && goal_distance < precise_goal_tolerance_ && std::abs(current_linear_vel_) < velocity_tolerance_) {
-            RCLCPP_INFO(get_logger(), "Precise goal reached! Final distance: %.3f", goal_distance);
-            path_updated_ = false;
+        
+        // Periodic status info
+        static rclcpp::Time last_info_time = this->now();
+        auto now_info = this->now();
+        if ((now_info - last_info_time).seconds() > 2.0) {
+            RCLCPP_INFO(get_logger(), "Control status: strategy=%s, time_idx=%.2f/%zu, vel=(%.2f,%.2f)", 
+                       effective_strategy.c_str(), current_time_index_, path_points_.size()-1, linear_vel, angular_vel);
+            last_info_time = now_info;
         }
     }
 
@@ -280,11 +421,16 @@ private:
     // ROS params
     double path_dt_, kp_linear_, kd_linear_, kp_angular_, kd_angular_, max_linear_vel_, max_angular_vel_, goal_tolerance_, lookahead_distance_, soft_start_time_, max_pos_error_, feedforward_ramp_time_, precise_goal_tolerance_, velocity_tolerance_, decel_distance_, min_decel_factor_, ki_linear_;
     int control_hz_;
+    bool enable_curveadapt_;
     std::string strategy_, map_frame_, robot_odom_frame_, robot_base_frame_, goal_frame_;
     
     // State
     double prev_angle_error_ = 0.0;
+    rclcpp::Time prev_angle_time_;
+    bool prev_angle_time_valid_ = false;
     std::vector<std::array<double,3>> path_points_;
+    std::atomic<uint64_t> path_version_{0};
+    std::atomic<uint64_t> current_path_version_{0};
     bool path_updated_ = false;
     double current_x_ = 0.0, current_y_ = 0.0, current_yaw_ = 0.0;
     double current_linear_vel_ = 0.0;
@@ -295,6 +441,11 @@ private:
     rclcpp::Time prev_time_;
     bool prev_time_valid_;
     std::mutex path_mutex_;
+    
+    // TF fallback mechanism
+    int tf_failure_count_ = 0;
+    bool fallback_to_openloop_ = false;
+    static constexpr int MAX_TF_FAILURES = 5;
     
     // ROS
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
