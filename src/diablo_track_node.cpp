@@ -346,11 +346,14 @@ private:
             return;
         }
         
-        // Try to get robot pose, fallback to open-loop if TF fails
-        bool tf_available = get_robot_pose();
-        if (!tf_available && !fallback_to_openloop_) {
-            publish_cmd(0.0, 0.0);
-            return;
+        // Only get robot pose for strategies that need position feedback
+        bool tf_available = false;
+        if (strategy_ != "open_loop") {
+            tf_available = get_robot_pose();
+            if (!tf_available && !fallback_to_openloop_) {
+                publish_cmd(0.0, 0.0);
+                return;
+            }
         }
         
         auto current_time = now();
