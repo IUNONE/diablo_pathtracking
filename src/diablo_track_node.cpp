@@ -2,7 +2,7 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav_msgs/msg/path.hpp"
-#include "diablo_pathtracking/msg/motion_ctrl.hpp"  // generated from MotionCtrl.msg
+#include "motion_msgs/msg/motion_ctrl.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -77,7 +77,7 @@ public:
             "planned_path", 5,
             std::bind(&DiabloTrackNode::path_callback, this, std::placeholders::_1));
 
-        cmd_pub_ = create_publisher<diablo_pathtracking::msg::MotionCtrl>("diablo/MotionCmd", 2);
+        cmd_pub_ = create_publisher<motion_msgs::msg::MotionCtrl>("diablo/MotionCmd", 2);
 
         control_timer_ = create_wall_timer(
             std::chrono::duration<double>(1.0 / control_hz_),
@@ -324,7 +324,7 @@ private:
     }
 
     void publish_cmd(double lin, double ang) {
-        diablo_pathtracking::msg::MotionCtrl cmd;
+        motion_msgs::msg::MotionCtrl cmd;
         cmd.value.forward = lin;
         cmd.value.left = ang;
         cmd_pub_->publish(cmd);
@@ -452,7 +452,7 @@ private:
     
     // ROS
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
-    rclcpp::Publisher<diablo_pathtracking::msg::MotionCtrl>::SharedPtr cmd_pub_;
+    rclcpp::Publisher<motion_msgs::msg::MotionCtrl>::SharedPtr cmd_pub_;
     rclcpp::TimerBase::SharedPtr control_timer_;
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
