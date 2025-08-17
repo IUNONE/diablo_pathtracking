@@ -80,6 +80,9 @@ private:
         for (int i = 0; i < num_points; ++i) {
             poses.push_back(create_pose_stamped(i * point_spacing_, 0.0, 0.0));
         }
+        if (!poses.empty()) {
+            poses.erase(poses.begin());
+        }
         return poses;
     }
 
@@ -98,6 +101,9 @@ private:
         for (int i = 1; i < num_points; ++i)
             poses.push_back(create_pose_stamped(0.0, side_length - i * point_spacing_, -M_PI / 2));
 
+        if (!poses.empty()) {
+            poses.erase(poses.begin());
+        }
         return poses;
     }
 
@@ -114,6 +120,9 @@ private:
             double y = radius * std::sin(angle);
             double yaw = angle + M_PI / 2;
             poses.push_back(create_pose_stamped(x, y, yaw));
+        }
+        if (!poses.empty()) {
+            poses.erase(poses.begin());
         }
         return poses;
     }
@@ -145,6 +154,9 @@ private:
             }
 
             poses.push_back(create_pose_stamped(x, y, yaw));
+        }
+        if (!poses.empty()) {
+            poses.erase(poses.begin());
         }
         return poses;
     }
