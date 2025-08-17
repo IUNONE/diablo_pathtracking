@@ -338,7 +338,7 @@ private:
         uint64_t latest_version = path_version_.load();
         if (current_path_version_ != latest_version) {
             current_path_version_ = latest_version;
-            RCLCPP_DEBUG(get_logger(), "Switched to path version: %lu", current_path_version_);
+            RCLCPP_DEBUG(get_logger(), "Switched to path version: %lu", current_path_version_.load());
         }
         
         if (!path_updated_ || path_points_.empty()) {
