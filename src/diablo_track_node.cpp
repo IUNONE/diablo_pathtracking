@@ -13,6 +13,29 @@
 #include <string>
 #include <algorithm>
 #include <chrono>
+#include <signal.h>
+#include <atomic>
+#include <thread>
+
+// Global variables for signal handling
+std::shared_ptr<class DiabloTrackNode> g_node = nullptr;
+std::atomic<bool> g_emergency_stop{false};
+
+// Signal handler for Ctrl+C
+void signal_handler(int signum) {
+    if (signum == SIGINT) {
+        g_emergency_stop.store(true);
+        RCLCPP_WARN(rclcpp::get_logger("signal_handler"), "Emergency stop triggered! Sending zero velocity...");
+        
+        if (g_node) {
+            g_node->emergency_stop();
+        }
+        
+        // Give some time for the emergency stop command to be sent
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        rclcpp::shutdown();
+    }
+}
 
 class DiabloTrackNode : public rclcpp::Node
 {
@@ -86,6 +109,13 @@ public:
         current_linear_vel_ = 0.0;
         prev_time_valid_ = false;
         RCLCPP_INFO(get_logger(), "Diablo Tracking Node Initialized");
+    }
+
+    // Emergency stop function - public so signal handler can access it
+    void emergency_stop() {
+        RCLCPP_WARN(get_logger(), "Emergency stop activated - sending zero velocity");
+        publish_cmd(0.0, 0.0);
+        emergency_stop_active_.store(true);
     }
 
 private:
@@ -334,6 +364,12 @@ private:
     {
         std::lock_guard<std::mutex> lock(path_mutex_);
         
+        // Check for emergency stop
+        if (emergency_stop_active_.load() || g_emergency_stop.load()) {
+            publish_cmd(0.0, 0.0);
+            return;
+        }
+        
         // Check path version to ensure using latest path
         uint64_t latest_version = path_version_.load();
         if (current_path_version_ != latest_version) {
@@ -445,6 +481,9 @@ private:
     bool prev_time_valid_;
     std::mutex path_mutex_;
     
+    // Emergency stop state
+    std::atomic<bool> emergency_stop_active_{false};
+    
     // TF fallback mechanism
     int tf_failure_count_ = 0;
     bool fallback_to_openloop_ = false;
@@ -462,6 +501,15 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<DiabloTrackNode>();
+    
+    // Set global node pointer for signal handler
+    g_node = node;
+    
+    // Register signal handler for Ctrl+C
+    signal(SIGINT, signal_handler);
+    
+    RCLCPP_INFO(node->get_logger(), "Emergency stop enabled - press Ctrl+C to stop robot");
+    
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
