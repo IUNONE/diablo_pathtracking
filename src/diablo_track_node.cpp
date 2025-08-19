@@ -18,21 +18,16 @@
 #include <thread>
 
 // Global variables for signal handling
-std::shared_ptr<class DiabloTrackNode> g_node = nullptr;
 std::atomic<bool> g_emergency_stop{false};
 
 // Signal handler for Ctrl+C
 void signal_handler(int signum) {
     if (signum == SIGINT) {
         g_emergency_stop.store(true);
-        RCLCPP_WARN(rclcpp::get_logger("signal_handler"), "Emergency stop triggered! Sending zero velocity...");
-        
-        if (g_node) {
-            g_node->emergency_stop();
-        }
+        RCLCPP_WARN(rclcpp::get_logger("signal_handler"), "Emergency stop triggered!");
         
         // Give some time for the emergency stop command to be sent
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         rclcpp::shutdown();
     }
 }
@@ -501,9 +496,6 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<DiabloTrackNode>();
-    
-    // Set global node pointer for signal handler
-    g_node = node;
     
     // Register signal handler for Ctrl+C
     signal(SIGINT, signal_handler);
