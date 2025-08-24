@@ -10,12 +10,12 @@ class TestTrackNode : public rclcpp::Node
 public:
     TestTrackNode() : Node("test_track_node")
     {
-        path_type_ = declare_parameter("path_type", std::string("line"));
-        path_length_ = declare_parameter("path_length", 1.5);
-        point_spacing_ = declare_parameter("point_spacing", 0.1);
-        publish_rate_ = declare_parameter("publish_rate", 1.0);
-        loop_publish_ = declare_parameter("loop_publish", false);
-        frame_id_ = declare_parameter("frame_id", std::string("base_link"));
+        path_type_ = declare_parameter<std::string>("path_type", "line");
+        path_length_ = declare_parameter<double>("path_length", 1.5);
+        point_spacing_ = declare_parameter<double>("point_spacing", 0.1);
+        publish_rate_ = declare_parameter<double>("publish_rate", 1.0);
+        loop_publish_ = declare_parameter<bool>("loop_publish", false);
+        frame_id_ = declare_parameter<std::string>("frame_id", "base_link");
 
         path_pub_ = create_publisher<nav_msgs::msg::Path>("/planned_path", 5);
 

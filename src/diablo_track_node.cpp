@@ -13,6 +13,24 @@
 #include <string>
 #include <algorithm>
 #include <chrono>
+#include <signal.h>
+#include <atomic>
+#include <thread>
+
+// Global variables for signal handling
+std::atomic<bool> g_emergency_stop{false};
+
+// Signal handler for Ctrl+C
+void signal_handler(int signum) {
+    if (signum == SIGINT) {
+        g_emergency_stop.store(true);
+        RCLCPP_WARN(rclcpp::get_logger("signal_handler"), "Emergency stop triggered!");
+        
+        // Give some time for the emergency stop command to be sent
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        rclcpp::shutdown();
+    }
+}
 
 class DiabloTrackNode : public rclcpp::Node
 {
@@ -21,34 +39,34 @@ public:
         tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_)
     {
         // Parameters
-        path_dt_ = declare_parameter("path_dt", 0.1);
-        control_hz_ = declare_parameter("control_hz", 50);
-        strategy_ = declare_parameter("strategy", std::string("pd"));
+        path_dt_ = declare_parameter<double>("path_dt", 0.1);
+        control_hz_ = declare_parameter<int>("control_hz", 50);
+        strategy_ = declare_parameter<std::string>("strategy", "pd");
 
-        map_frame_ = declare_parameter("map_frame", std::string("map"));
-        robot_odom_frame_ = declare_parameter("robot_odom_frame", std::string("odom"));
-        robot_base_frame_ = declare_parameter("robot_base_frame", std::string("base_link"));
-        goal_frame_ = declare_parameter("goal_frame", std::string("goal"));
+        map_frame_ = declare_parameter<std::string>("map_frame", "map");
+        robot_odom_frame_ = declare_parameter<std::string>("robot_odom_frame", "odom");
+        robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "base_link");
+        goal_frame_ = declare_parameter<std::string>("goal_frame", "goal");
 
-        kp_linear_ = declare_parameter("kp_linear", 1.0);
-        kd_linear_ = declare_parameter("kd_linear", 0.1);
-        kp_angular_ = declare_parameter("kp_angular", 2.0);
-        kd_angular_ = declare_parameter("kd_angular", 0.2);
-        max_linear_vel_ = declare_parameter("max_linear_vel", 2.0);
-        max_angular_vel_ = declare_parameter("max_angular_vel", 0.2);
-        goal_tolerance_ = declare_parameter("goal_tolerance", 0.1);
-        lookahead_distance_ = declare_parameter("lookahead_distance", 0.5);
+        kp_linear_ = declare_parameter<double>("kp_linear", 1.0);
+        kd_linear_ = declare_parameter<double>("kd_linear", 0.1);
+        kp_angular_ = declare_parameter<double>("kp_angular", 2.0);
+        kd_angular_ = declare_parameter<double>("kd_angular", 0.2);
+        max_linear_vel_ = declare_parameter<double>("max_linear_vel", 2.0);
+        max_angular_vel_ = declare_parameter<double>("max_angular_vel", 0.2);
+        goal_tolerance_ = declare_parameter<double>("goal_tolerance", 0.1);
+        lookahead_distance_ = declare_parameter<double>("lookahead_distance", 0.5);
 
-        soft_start_time_ = declare_parameter("soft_start_time", 2.0);
-        max_pos_error_ = declare_parameter("max_pos_error", 1.0);
-        feedforward_ramp_time_ = declare_parameter("feedforward_ramp_time", 1.5);
+        soft_start_time_ = declare_parameter<double>("soft_start_time", 2.0);
+        max_pos_error_ = declare_parameter<double>("max_pos_error", 1.0);
+        feedforward_ramp_time_ = declare_parameter<double>("feedforward_ramp_time", 1.5);
 
-        precise_goal_tolerance_ = declare_parameter("precise_goal_tolerance", 0.02);
-        velocity_tolerance_ = declare_parameter("velocity_tolerance", 0.05);
-        decel_distance_ = declare_parameter("decel_distance", 0.2);
-        min_decel_factor_ = declare_parameter("min_decel_factor", 0.1);
-        ki_linear_ = declare_parameter("ki_linear", 0.05);
-        enable_curveadapt_ = declare_parameter("enable_curveadapt", true);
+        precise_goal_tolerance_ = declare_parameter<double>("precise_goal_tolerance", 0.02);
+        velocity_tolerance_ = declare_parameter<double>("velocity_tolerance", 0.05);
+        decel_distance_ = declare_parameter<double>("decel_distance", 0.2);
+        min_decel_factor_ = declare_parameter<double>("min_decel_factor", 0.1);
+        ki_linear_ = declare_parameter<double>("ki_linear", 0.05);
+        enable_curveadapt_ = declare_parameter<bool>("enable_curveadapt", true);
 
         if (strategy_ != "pd" && strategy_ != "pid" && strategy_ != "open_loop") {
             RCLCPP_FATAL(get_logger(), "Invalid strategy: %s", strategy_.c_str());
@@ -86,6 +104,13 @@ public:
         current_linear_vel_ = 0.0;
         prev_time_valid_ = false;
         RCLCPP_INFO(get_logger(), "Diablo Tracking Node Initialized");
+    }
+
+    // Emergency stop function - public so signal handler can access it
+    void emergency_stop() {
+        RCLCPP_WARN(get_logger(), "Emergency stop activated - sending zero velocity");
+        publish_cmd(0.0, 0.0);
+        emergency_stop_active_.store(true);
     }
 
 private:
@@ -334,6 +359,12 @@ private:
     {
         std::lock_guard<std::mutex> lock(path_mutex_);
         
+        // Check for emergency stop
+        if (emergency_stop_active_.load() || g_emergency_stop.load()) {
+            publish_cmd(0.0, 0.0);
+            return;
+        }
+        
         // Check path version to ensure using latest path
         uint64_t latest_version = path_version_.load();
         if (current_path_version_ != latest_version) {
@@ -445,6 +476,9 @@ private:
     bool prev_time_valid_;
     std::mutex path_mutex_;
     
+    // Emergency stop state
+    std::atomic<bool> emergency_stop_active_{false};
+    
     // TF fallback mechanism
     int tf_failure_count_ = 0;
     bool fallback_to_openloop_ = false;
@@ -462,6 +496,12 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<DiabloTrackNode>();
+    
+    // Register signal handler for Ctrl+C
+    signal(SIGINT, signal_handler);
+    
+    RCLCPP_INFO(node->get_logger(), "Emergency stop enabled - press Ctrl+C to stop robot");
+    
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
