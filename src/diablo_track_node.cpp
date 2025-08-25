@@ -111,7 +111,7 @@ private:
                     elapsed, lin, ang * 180.0 / M_PI);
     }
 
-    bool _get_tf(){
+    void update_current_pose(){
         try {
             geometry_msgs::msg::TransformStamped transform = tf_buffer_.lookupTransform(
                 robot_odom_frame_, robot_base_frame_, 
@@ -122,12 +122,14 @@ private:
             current_y_ = transform.transform.translation.y;
             current_yaw_ = get_yaw_from_quaternion(transform.transform.rotation);
             
-            return true;
+            return;
         } 
         catch (tf2::TransformException &ex) {
-            RCLCPP_ERROR(get_logger(), "TF lookup failed for %s", ex.what());
-            return false;
+            RCLCPP_ERROR(get_logger(), "Call StopMove Api. TF lookup failed for %s", ex.what());
+            _publish_cmd(0.0, 0.0);
+            return;
         }
+
     }
 
     /** 
@@ -168,14 +170,16 @@ private:
         
         // 3. Reset all control states
         if (strategy_ == "pd") {
+            update_current_pose();
+            path_start_pos_global_ = {current_x_, current_y_, current_yaw_};
             prev_pos_error_ = {0.0, 0.0, 0.0};
             prev_time_valid_ = false;
         }
         path_version_.fetch_add(1);
         path_updated_ = true;
         RCLCPP_INFO(get_logger(), "#########################################");
-        RCLCPP_INFO(get_logger(), "New path received with %zu points, version: %lu, strategy: %s", 
-                   msg->poses.size(), path_version_.load(), strategy_.c_str());
+        RCLCPP_INFO(get_logger(), "New path received with %zu points, version: %lu", 
+                   msg->poses.size(), path_version_.load());
         path_start_time_ = now();
     }
 
@@ -184,11 +188,17 @@ private:
         
         size_t subgoal_idx = static_cast<size_t>(elapsed_time / path_dt_) + 1;
         
-        // error
+        // error in path start frame
+        double x0 = path_start_pos_global_[0];
+        double y0 = path_start_pos_global_[1];
+        double yaw0 = path_start_pos_global_[2];
+        double current_x_local_ = cos(yaw0) * (current_x_ - x0) + sin(yaw0) * (current_y_ - y0);
+        double current_y_local_ = -sin(yaw0) * (current_x_ - x0) + cos(yaw0) * (current_y_ - y0);
+        double current_yaw_local_ = normalize_angle(current_yaw_ - yaw0);
         std::array<double, 3> pos_error = {
-            path_points_[subgoal_idx][0] - current_x_, 
-            path_points_[subgoal_idx][1] - current_y_, 
-            normalize_angle(path_points_[subgoal_idx][2] - current_yaw_)
+            path_points_[subgoal_idx][0] - current_x_local_, 
+            path_points_[subgoal_idx][1] - current_y_local_, 
+            normalize_angle(path_points_[subgoal_idx][2] - current_yaw_local_)
         };
         double pos_err_mag = std::hypot(pos_error[0], pos_error[1]);
         if (pos_err_mag > max_pos_error_) {
@@ -227,12 +237,17 @@ private:
         prev_time_ = now_time;
         prev_pos_error_ = pos_error;
 
-        double linear_vel = std::hypot(total_desired_vel[0], total_desired_vel[1]);
+        // transform to base_link frame
+        double dyaw = current_yaw_ - yaw0;
+        double x_vel =  total_desired_vel[0] * cos(dyaw) + total_desired_vel[1] * sin(dyaw);
+
+        // double y_vel = -total_desired_vel[0] * sin(dyaw) + total_desired_vel[1] * cos(dyaw);
+        // double linear_vel = std::hypot(total_desired_vel[0], total_desired_vel[1]);
+        
         double angular_vel = total_desired_vel[2];
 
-        return {linear_vel, angular_vel};
+        return {x_vel, angular_vel};
     }
-
 
     std::pair<double, double> calculate_openloop_control(double elapsed_time){
         
@@ -254,12 +269,7 @@ private:
             return;
         }
         if (strategy_ == "pd") {
-            bool tf_available = false;
-            tf_available = _get_tf();
-            if (!tf_available) {
-                _publish_cmd(0.0, 0.0);
-                return;
-            }
+            update_current_pose();
         }
 
         // check path
@@ -277,7 +287,7 @@ private:
         double elapsed_time = (current_time - path_start_time_).seconds();
         bool at_path_end = (elapsed_time / path_dt_) >= (path_points_.size() - 1);
         if (at_path_end) {
-            RCLCPP_INFO(get_logger(), "Path execution completed (open-loop mode)");
+            RCLCPP_INFO(get_logger(), "Path execution completed");
             path_updated_ = false;
             _publish_cmd(0.0, 0.0);
             return;
@@ -308,7 +318,7 @@ private:
     double path_dt_;
     std::mutex path_mutex_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
-    std::vector<std::array<double,6>> path_points_; // x, y, yaw, vx, vy, vyaw
+    std::vector<std::array<double,6>> path_points_;                     // x, y, yaw, vx, vy, vyaw
     std::atomic<uint64_t> path_version_{0};
     std::atomic<uint64_t> current_path_version_{0};
     bool path_updated_ = false;
@@ -330,7 +340,8 @@ private:
     int control_hz_;
 
     // pd + feedforward
-    std::array<double,3> prev_pos_error_ = {0.0,0.0, 0.0};
+    std::array<double,3> path_start_pos_global_ = {0.0, 0.0, 0.0};
+    std::array<double,3> prev_pos_error_ = {0.0, 0.0, 0.0};
     double max_pos_error_;
     double kp_linear_, kd_linear_;
     double kp_angular_, kd_angular_;
